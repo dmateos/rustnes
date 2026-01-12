@@ -1,0 +1,9 @@
+[package]
+name = "rustnes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0"
+pixels = "0.15"
+winit = "0.30"
