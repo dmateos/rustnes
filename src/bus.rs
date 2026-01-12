@@ -70,9 +70,15 @@ pub struct Bus {
     // TODO: Add APU when implemented
     // apu: Apu,
 
-    // TODO: Add controller input when implemented
-    // controller1: Controller,
-    // controller2: Controller,
+    /// Controller 1 button states (directly set by input handling)
+    /// Bits: A, B, Select, Start, Up, Down, Left, Right
+    controller1_state: u8,
+
+    /// Controller 1 shift register (latched state being read out)
+    controller1_shift: u8,
+
+    /// Controller strobe latch (when high, continuously reload shift register)
+    controller_strobe: bool,
 }
 
 impl Bus {
@@ -96,6 +102,9 @@ impl Bus {
             cartridge: None,
             ppu,
             mmc1: None,
+            controller1_state: 0,
+            controller1_shift: 0,
+            controller_strobe: false,
         }
     }
 
@@ -126,6 +135,9 @@ impl Bus {
             cartridge: Some(cartridge),
             ppu,
             mmc1: if uses_mmc1 { Some(Mmc1::new()) } else { None },
+            controller1_state: 0,
+            controller1_shift: 0,
+            controller_strobe: false,
         }
     }
 
@@ -175,11 +187,23 @@ impl Bus {
             // OAMDMA ($4014) is write-only; reads typically return open bus (0 here)
             0x4014 => 0,
 
-            // Controller ports ($4016-$4017)
-            0x4016..=0x4017 => {
-                // TODO: Implement controller shift registers
-                0
+            // Controller port 1 ($4016)
+            0x4016 => {
+                // If strobe is high, always return current state of A button
+                if self.controller_strobe {
+                    self.controller1_state & 1
+                } else {
+                    // Return bit 0 of shift register, then shift right
+                    let result = self.controller1_shift & 1;
+                    self.controller1_shift >>= 1;
+                    // After 8 reads, returns 1s (open bus behavior)
+                    self.controller1_shift |= 0x80;
+                    result
+                }
             }
+
+            // Controller port 2 ($4017) - not implemented, return 0
+            0x4017 => 0,
 
             // APU and I/O functionality that is normally disabled ($4018-$401F)
             0x4018..=0x401F => {
@@ -262,10 +286,18 @@ impl Bus {
                 // Proper CPU stall cycles (513 or 514) are not yet modeled; this is functional only.
             }
 
-            // Controller ports ($4016-$4017)
-            0x4016..=0x4017 => {
-                // TODO: Implement controller latch/shift behaviour
+            // Controller strobe ($4016)
+            0x4016 => {
+                let new_strobe = (value & 1) != 0;
+                // When strobe goes from high to low, latch controller state
+                if self.controller_strobe && !new_strobe {
+                    self.controller1_shift = self.controller1_state;
+                }
+                self.controller_strobe = new_strobe;
             }
+
+            // $4017 is APU frame counter, ignore for now
+            0x4017 => {}
 
             // APU and I/O functionality that is normally disabled ($4018-$401F)
             0x4018..=0x401F => {
@@ -530,6 +562,21 @@ impl Bus {
         };
         self.ppu
             .set_chr_banks(chr_mode_4k, bank0_offset, bank1_offset);
+    }
+
+    /// Set controller 1 button state.
+    ///
+    /// Button bits (directly map to NES controller shift register order):
+    /// - Bit 0: A
+    /// - Bit 1: B
+    /// - Bit 2: Select
+    /// - Bit 3: Start
+    /// - Bit 4: Up
+    /// - Bit 5: Down
+    /// - Bit 6: Left
+    /// - Bit 7: Right
+    pub fn set_controller1(&mut self, buttons: u8) {
+        self.controller1_state = buttons;
     }
 }
 

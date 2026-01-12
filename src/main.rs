@@ -19,11 +19,23 @@ const SCREEN_WIDTH: u32 = 256;
 const SCREEN_HEIGHT: u32 = 240;
 const SCALE: u32 = 3; // 3x scaling for better visibility
 
+/// Controller button bit masks
+const BTN_A: u8 = 0x01;
+const BTN_B: u8 = 0x02;
+const BTN_SELECT: u8 = 0x04;
+const BTN_START: u8 = 0x08;
+const BTN_UP: u8 = 0x10;
+const BTN_DOWN: u8 = 0x20;
+const BTN_LEFT: u8 = 0x40;
+const BTN_RIGHT: u8 = 0x80;
+
 /// Application state for the emulator
 struct EmulatorApp {
     window_ref: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
     cpu: Option<Cpu>,
+    /// Current controller 1 button state
+    controller1: u8,
 }
 
 impl EmulatorApp {
@@ -32,6 +44,7 @@ impl EmulatorApp {
             window_ref: None,
             pixels: None,
             cpu: None,
+            controller1: 0,
         }
     }
 
@@ -39,8 +52,26 @@ impl EmulatorApp {
         self.cpu = Some(cpu);
     }
 
+    /// Map a key code to controller button mask
+    fn key_to_button(key: KeyCode) -> Option<u8> {
+        match key {
+            KeyCode::KeyX => Some(BTN_A),      // X = A
+            KeyCode::KeyZ => Some(BTN_B),      // Z = B
+            KeyCode::ShiftRight => Some(BTN_SELECT),
+            KeyCode::Enter => Some(BTN_START),
+            KeyCode::ArrowUp => Some(BTN_UP),
+            KeyCode::ArrowDown => Some(BTN_DOWN),
+            KeyCode::ArrowLeft => Some(BTN_LEFT),
+            KeyCode::ArrowRight => Some(BTN_RIGHT),
+            _ => None,
+        }
+    }
+
     fn render_frame(&mut self) {
         if let (Some(cpu), Some(pixels)) = (&mut self.cpu, &mut self.pixels) {
+            // Update controller state
+            cpu.bus.set_controller1(self.controller1);
+
             // Run emulation until a frame completes
             let mut nmi_triggered = false;
 
@@ -134,9 +165,19 @@ impl ApplicationHandler for EmulatorApp {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    // Handle escape to exit
+                    if key == KeyCode::Escape && event.state == ElementState::Pressed {
                         event_loop.exit();
+                        return;
+                    }
+
+                    // Handle controller buttons
+                    if let Some(button) = Self::key_to_button(key) {
+                        match event.state {
+                            ElementState::Pressed => self.controller1 |= button,
+                            ElementState::Released => self.controller1 &= !button,
+                        }
                     }
                 }
             }
