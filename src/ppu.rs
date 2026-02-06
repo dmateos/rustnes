@@ -239,6 +239,10 @@ pub struct Ppu {
     chr_bank0_offset: usize,
     chr_bank1_offset: usize,
 
+    /// MMC3-style 1KB CHR banks (8 banks covering $0000-$1FFF)
+    /// If enabled, overrides the 4KB bank mode
+    chr_banks_1kb: Option<[usize; 8]>,
+
     /// Reference to CHR ROM (for pattern tables)
     chr_rom: Vec<u8>,
 
@@ -287,6 +291,7 @@ impl Ppu {
             chr_bank_mode_4k: false,
             chr_bank0_offset: 0,
             chr_bank1_offset: 0x1000,
+            chr_banks_1kb: None,
             chr_rom,
             framebuffer: [0; FRAMEBUFFER_SIZE],
         }
@@ -308,6 +313,23 @@ impl Ppu {
     /// Update nametable mirroring at runtime (for mappers that support it).
     pub fn set_mirroring(&mut self, mirroring: Mirroring) {
         self.mirroring = mirroring;
+    }
+
+    /// Set CHR banks with 1KB granularity for MMC3.
+    ///
+    /// # Arguments
+    ///
+    /// * `banks` - Array of 8 bank offsets (in bytes) for each 1KB region ($0000-$1FFF)
+    ///   - banks[0]: $0000-$03FF
+    ///   - banks[1]: $0400-$07FF
+    ///   - banks[2]: $0800-$0BFF
+    ///   - banks[3]: $0C00-$0FFF
+    ///   - banks[4]: $1000-$13FF
+    ///   - banks[5]: $1400-$17FF
+    ///   - banks[6]: $1800-$1BFF
+    ///   - banks[7]: $1C00-$1FFF
+    pub fn set_chr_banks_1kb(&mut self, banks: [usize; 8]) {
+        self.chr_banks_1kb = Some(banks);
     }
 
     /// Perform a sprite DMA transfer from CPU memory into OAM.
@@ -575,21 +597,37 @@ impl Ppu {
         match addr {
             // Pattern tables (CHR ROM)
             0x0000..=0x1FFF => {
-                let (bank_offset, offset_within_bank) = if self.chr_bank_mode_4k {
-                    if addr < 0x1000 {
-                        (self.chr_bank0_offset, addr as usize)
+                // Check if using MMC3-style 1KB banking
+                if let Some(banks) = self.chr_banks_1kb {
+                    // Determine which 1KB bank (0-7) based on address
+                    let bank_index = (addr / 0x400) as usize;  // Each bank is 1KB (0x400 bytes)
+                    let offset_within_bank = (addr % 0x400) as usize;
+                    let bank_offset = banks[bank_index];
+
+                    let index = bank_offset + offset_within_bank;
+                    if index < self.chr_rom.len() {
+                        self.chr_rom[index]
                     } else {
-                        (self.chr_bank1_offset, (addr - 0x1000) as usize)
+                        0
                     }
                 } else {
-                    (self.chr_bank0_offset, addr as usize)
-                };
+                    // Fall back to 4KB banking mode (MMC1 style)
+                    let (bank_offset, offset_within_bank) = if self.chr_bank_mode_4k {
+                        if addr < 0x1000 {
+                            (self.chr_bank0_offset, addr as usize)
+                        } else {
+                            (self.chr_bank1_offset, (addr - 0x1000) as usize)
+                        }
+                    } else {
+                        (self.chr_bank0_offset, addr as usize)
+                    };
 
-                let index = bank_offset + offset_within_bank;
-                if index < self.chr_rom.len() {
-                    self.chr_rom[index]
-                } else {
-                    0
+                    let index = bank_offset + offset_within_bank;
+                    if index < self.chr_rom.len() {
+                        self.chr_rom[index]
+                    } else {
+                        0
+                    }
                 }
             }
 

@@ -754,9 +754,7 @@ impl Bus {
         };
         self.ppu.set_mirroring(mirroring);
 
-        // Update CHR banks
-        // MMC3 has complex CHR banking with 1KB granularity
-        // For now, use a simplified approach that works with the existing PPU interface
+        // Update CHR banks with full 1KB granularity
         let chr_mode = (mmc3.bank_select >> 7) & 1;
         let chr_rom_size = cartridge.chr_rom.len();
 
@@ -765,38 +763,50 @@ impl Bus {
             return;
         }
 
-        // MMC3 CHR banking:
-        // - R0, R1 are 2KB banks (even values only)
+        // MMC3 CHR banking: 8 separate 1KB banks
+        // - R0, R1 are 2KB banks (use even values, control 2 consecutive 1KB slots)
         // - R2-R5 are 1KB banks
         // - Bit 7 of bank_select controls which pattern table each set targets
 
+        let mut banks = [0usize; 8];
+
         if chr_mode == 0 {
-            // Mode 0: R0/R1 target $0000-$0FFF (2KB each), R2-R5 target $1000-$1FFF (1KB each)
-            // R0: 2KB bank at $0000-$07FF
-            let bank0_offset = ((mmc3.bank_registers[0] & 0xFE) as usize) * 0x400;
+            // Mode 0: R0/R1 at $0000-$0FFF (2KB each), R2-R5 at $1000-$1FFF (1KB each)
+            // R0: 2KB bank at $0000-$07FF (controls banks 0 and 1)
+            let r0_base = ((mmc3.bank_registers[0] & 0xFE) as usize) * 0x400;
+            banks[0] = r0_base % chr_rom_size.max(1);
+            banks[1] = (r0_base + 0x400) % chr_rom_size.max(1);
 
-            // R1: 2KB bank at $0800-$0FFF
-            let bank1_offset = ((mmc3.bank_registers[1] & 0xFE) as usize) * 0x400;
+            // R1: 2KB bank at $0800-$0FFF (controls banks 2 and 3)
+            let r1_base = ((mmc3.bank_registers[1] & 0xFE) as usize) * 0x400;
+            banks[2] = r1_base % chr_rom_size.max(1);
+            banks[3] = (r1_base + 0x400) % chr_rom_size.max(1);
 
-            // Use the existing 4KB bank interface
-            // This is an approximation - use the first 2KB bank for lower 4KB
-            self.ppu.set_chr_banks(
-                true,  // Use 4K mode
-                bank0_offset % chr_rom_size.max(1),
-                bank1_offset % chr_rom_size.max(1),
-            );
+            // R2-R5: 1KB banks at $1000-$1FFF (controls banks 4-7)
+            banks[4] = (mmc3.bank_registers[2] as usize) * 0x400 % chr_rom_size.max(1);
+            banks[5] = (mmc3.bank_registers[3] as usize) * 0x400 % chr_rom_size.max(1);
+            banks[6] = (mmc3.bank_registers[4] as usize) * 0x400 % chr_rom_size.max(1);
+            banks[7] = (mmc3.bank_registers[5] as usize) * 0x400 % chr_rom_size.max(1);
         } else {
-            // Mode 1: R0/R1 target $1000-$1FFF, R2-R5 target $0000-$0FFF
-            // Inverted - R2-R5 go to lower pattern table
-            let bank0_offset = (mmc3.bank_registers[2] as usize) * 0x400;
-            let bank1_offset = ((mmc3.bank_registers[0] & 0xFE) as usize) * 0x400;
+            // Mode 1: R2-R5 at $0000-$0FFF (1KB each), R0/R1 at $1000-$1FFF (2KB each)
+            // R2-R5: 1KB banks at $0000-$0FFF (controls banks 0-3)
+            banks[0] = (mmc3.bank_registers[2] as usize) * 0x400 % chr_rom_size.max(1);
+            banks[1] = (mmc3.bank_registers[3] as usize) * 0x400 % chr_rom_size.max(1);
+            banks[2] = (mmc3.bank_registers[4] as usize) * 0x400 % chr_rom_size.max(1);
+            banks[3] = (mmc3.bank_registers[5] as usize) * 0x400 % chr_rom_size.max(1);
 
-            self.ppu.set_chr_banks(
-                true,
-                bank0_offset % chr_rom_size.max(1),
-                bank1_offset % chr_rom_size.max(1),
-            );
+            // R0: 2KB bank at $1000-$17FF (controls banks 4 and 5)
+            let r0_base = ((mmc3.bank_registers[0] & 0xFE) as usize) * 0x400;
+            banks[4] = r0_base % chr_rom_size.max(1);
+            banks[5] = (r0_base + 0x400) % chr_rom_size.max(1);
+
+            // R1: 2KB bank at $1800-$1FFF (controls banks 6 and 7)
+            let r1_base = ((mmc3.bank_registers[1] & 0xFE) as usize) * 0x400;
+            banks[6] = r1_base % chr_rom_size.max(1);
+            banks[7] = (r1_base + 0x400) % chr_rom_size.max(1);
         }
+
+        self.ppu.set_chr_banks_1kb(banks);
     }
 
     /// Clock the MMC3 IRQ counter (called when A12 rises).
