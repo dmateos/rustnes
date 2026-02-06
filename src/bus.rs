@@ -45,6 +45,59 @@ impl Mmc1 {
     }
 }
 
+/// MMC3 mapper state (used by Super Mario Bros. 3 and many other games).
+struct Mmc3 {
+    /// Bank select register ($8000 even addresses)
+    /// Bits 0-2: Bank register to update (0-7)
+    /// Bit 6: PRG ROM bank mode (0 or 1)
+    /// Bit 7: CHR A12 inversion (CHR bank mode)
+    bank_select: u8,
+
+    /// Bank registers (8 registers for PRG and CHR)
+    /// R0, R1: 2KB CHR banks (or 1KB in bank mode 1)
+    /// R2-R5: 1KB CHR banks
+    /// R6, R7: 8KB PRG banks
+    bank_registers: [u8; 8],
+
+    /// Mirroring control ($A000 even addresses)
+    /// Bit 0: 0=vertical, 1=horizontal
+    mirroring: u8,
+
+    /// PRG RAM protect ($A001 odd addresses)
+    prg_ram_protect: u8,
+
+    /// IRQ latch value ($C000 even addresses)
+    irq_latch: u8,
+
+    /// IRQ counter (decrements on A12 rise)
+    irq_counter: u8,
+
+    /// IRQ reload flag (set by $C001 write)
+    irq_reload: bool,
+
+    /// IRQ enabled ($E001 sets, $E000 clears)
+    irq_enabled: bool,
+
+    /// Track previous A12 state for edge detection
+    last_a12: bool,
+}
+
+impl Mmc3 {
+    fn new() -> Self {
+        Mmc3 {
+            bank_select: 0,
+            bank_registers: [0; 8],
+            mirroring: 0,
+            prg_ram_protect: 0,
+            irq_latch: 0,
+            irq_counter: 0,
+            irq_reload: false,
+            irq_enabled: false,
+            last_a12: false,
+        }
+    }
+}
+
 /// NES CPU memory bus.
 ///
 /// The bus owns all the components and handles memory-mapped I/O.
@@ -67,6 +120,9 @@ pub struct Bus {
 
     /// MMC1 mapper state (if cartridge uses mapper 1)
     mmc1: Option<Mmc1>,
+
+    /// MMC3 mapper state (if cartridge uses mapper 4)
+    mmc3: Option<Mmc3>,
     // TODO: Add APU when implemented
     // apu: Apu,
 
@@ -102,6 +158,7 @@ impl Bus {
             cartridge: None,
             ppu,
             mmc1: None,
+            mmc3: None,
             controller1_state: 0,
             controller1_shift: 0,
             controller_strobe: false,
@@ -128,6 +185,7 @@ impl Bus {
         let mirroring = cartridge.mirroring;
         let ppu = Ppu::new(chr_rom, mirroring);
         let uses_mmc1 = cartridge_uses_mmc1(&cartridge);
+        let uses_mmc3 = cartridge_uses_mmc3(&cartridge);
 
         Bus {
             ram: [0; RAM_SIZE],
@@ -135,6 +193,7 @@ impl Bus {
             cartridge: Some(cartridge),
             ppu,
             mmc1: if uses_mmc1 { Some(Mmc1::new()) } else { None },
+            mmc3: if uses_mmc3 { Some(Mmc3::new()) } else { None },
             controller1_state: 0,
             controller1_shift: 0,
             controller_strobe: false,
@@ -321,6 +380,7 @@ impl Bus {
                 if let Some(ref cartridge) = self.cartridge {
                     match cartridge.mapper {
                         1 => self.mmc1_write(address, value),
+                        4 => self.mmc3_write(address, value),
                         _ => {
                             // Other mappers not yet implemented
                         }
@@ -374,6 +434,9 @@ impl Bus {
 
             // Mapper 1 (MMC1)
             1 => self.read_prg_mmc1(address, cartridge),
+
+            // Mapper 4 (MMC3)
+            4 => self.read_prg_mmc3(address, cartridge),
 
             // Other mappers - TODO: implement as needed
             _ => {
@@ -437,6 +500,63 @@ impl Bus {
         };
 
         cartridge.prg_rom.get(index).copied().unwrap_or(0)
+    }
+
+    fn read_prg_mmc3(&self, address: u16, cartridge: &Cartridge) -> u8 {
+        let Some(ref mmc3) = self.mmc3 else {
+            // Fallback: treat as fixed banks
+            let rom_address = (address - 0x8000) as usize;
+            return cartridge.prg_rom.get(rom_address).copied().unwrap_or(0);
+        };
+
+        let prg_rom_size = cartridge.prg_rom.len();
+        let bank_size_8k = 0x2000; // 8KB
+        let bank_count = prg_rom_size / bank_size_8k;
+
+        // Determine bank mode from bit 6 of bank select
+        let prg_mode = (mmc3.bank_select >> 6) & 1;
+
+        // Calculate which 8KB bank to use based on address
+        let (bank_num, offset_in_bank) = match address {
+            0x8000..=0x9FFF => {
+                // First 8KB window
+                if prg_mode == 0 {
+                    // Mode 0: R6 bank switchable
+                    let bank = (mmc3.bank_registers[6] as usize) % bank_count.max(1);
+                    (bank, (address - 0x8000) as usize)
+                } else {
+                    // Mode 1: Fixed to second-last bank
+                    let bank = bank_count.saturating_sub(2);
+                    (bank, (address - 0x8000) as usize)
+                }
+            }
+            0xA000..=0xBFFF => {
+                // Second 8KB window (always R7)
+                let bank = (mmc3.bank_registers[7] as usize) % bank_count.max(1);
+                (bank, (address - 0xA000) as usize)
+            }
+            0xC000..=0xDFFF => {
+                // Third 8KB window
+                if prg_mode == 0 {
+                    // Mode 0: Fixed to second-last bank
+                    let bank = bank_count.saturating_sub(2);
+                    (bank, (address - 0xC000) as usize)
+                } else {
+                    // Mode 1: R6 bank switchable
+                    let bank = (mmc3.bank_registers[6] as usize) % bank_count.max(1);
+                    (bank, (address - 0xC000) as usize)
+                }
+            }
+            0xE000..=0xFFFF => {
+                // Fourth 8KB window (always last bank)
+                let bank = bank_count.saturating_sub(1);
+                (bank, (address - 0xE000) as usize)
+            }
+            _ => unreachable!(),
+        };
+
+        let physical_address = (bank_num * bank_size_8k) + offset_in_bank;
+        cartridge.prg_rom.get(physical_address).copied().unwrap_or(0)
     }
 
     /// Read a 16-bit word from the bus (little-endian).
@@ -564,6 +684,121 @@ impl Bus {
             .set_chr_banks(chr_mode_4k, bank0_offset, bank1_offset);
     }
 
+    fn mmc3_write(&mut self, address: u16, value: u8) {
+        let Some(ref mut mmc3) = self.mmc3 else {
+            return;
+        };
+
+        match address {
+            // Even addresses: Bank select ($8000, $8002, etc.)
+            0x8000..=0x9FFF if address & 1 == 0 => {
+                mmc3.bank_select = value;
+            }
+
+            // Odd addresses: Bank data ($8001, $8003, etc.)
+            0x8000..=0x9FFF if address & 1 == 1 => {
+                let register = (mmc3.bank_select & 0x07) as usize;
+                mmc3.bank_registers[register] = value;
+                self.apply_mmc3_banks();
+            }
+
+            // Mirroring ($A000 even)
+            0xA000..=0xBFFF if address & 1 == 0 => {
+                mmc3.mirroring = value;
+                self.apply_mmc3_banks();
+            }
+
+            // PRG RAM protect ($A001 odd)
+            0xA000..=0xBFFF if address & 1 == 1 => {
+                mmc3.prg_ram_protect = value;
+            }
+
+            // IRQ latch ($C000 even)
+            0xC000..=0xDFFF if address & 1 == 0 => {
+                mmc3.irq_latch = value;
+            }
+
+            // IRQ reload ($C001 odd)
+            0xC000..=0xDFFF if address & 1 == 1 => {
+                mmc3.irq_reload = true;
+                mmc3.irq_counter = 0;
+            }
+
+            // IRQ disable ($E000 even)
+            0xE000..=0xFFFF if address & 1 == 0 => {
+                mmc3.irq_enabled = false;
+            }
+
+            // IRQ enable ($E001 odd)
+            0xE000..=0xFFFF if address & 1 == 1 => {
+                mmc3.irq_enabled = true;
+            }
+
+            _ => {}
+        }
+    }
+
+    fn apply_mmc3_banks(&mut self) {
+        let Some(ref cartridge) = self.cartridge else {
+            return;
+        };
+        let Some(ref mmc3) = self.mmc3 else {
+            return;
+        };
+
+        // Update mirroring
+        let mirroring = if (mmc3.mirroring & 0x01) == 0 {
+            Mirroring::Vertical
+        } else {
+            Mirroring::Horizontal
+        };
+        self.ppu.set_mirroring(mirroring);
+
+        // Update CHR banks
+        // MMC3 has complex CHR banking with 1KB granularity
+        // For now, use a simplified approach that works with the existing PPU interface
+        let chr_mode = (mmc3.bank_select >> 7) & 1;
+        let chr_rom_size = cartridge.chr_rom.len();
+
+        if chr_rom_size == 0 {
+            // CHR RAM - no banking needed
+            return;
+        }
+
+        // MMC3 CHR banking:
+        // - R0, R1 are 2KB banks (even values only)
+        // - R2-R5 are 1KB banks
+        // - Bit 7 of bank_select controls which pattern table each set targets
+
+        if chr_mode == 0 {
+            // Mode 0: R0/R1 target $0000-$0FFF (2KB each), R2-R5 target $1000-$1FFF (1KB each)
+            // R0: 2KB bank at $0000-$07FF
+            let bank0_offset = ((mmc3.bank_registers[0] & 0xFE) as usize) * 0x400;
+
+            // R1: 2KB bank at $0800-$0FFF
+            let bank1_offset = ((mmc3.bank_registers[1] & 0xFE) as usize) * 0x400;
+
+            // Use the existing 4KB bank interface
+            // This is an approximation - use the first 2KB bank for lower 4KB
+            self.ppu.set_chr_banks(
+                true,  // Use 4K mode
+                bank0_offset % chr_rom_size.max(1),
+                bank1_offset % chr_rom_size.max(1),
+            );
+        } else {
+            // Mode 1: R0/R1 target $1000-$1FFF, R2-R5 target $0000-$0FFF
+            // Inverted - R2-R5 go to lower pattern table
+            let bank0_offset = (mmc3.bank_registers[2] as usize) * 0x400;
+            let bank1_offset = ((mmc3.bank_registers[0] & 0xFE) as usize) * 0x400;
+
+            self.ppu.set_chr_banks(
+                true,
+                bank0_offset % chr_rom_size.max(1),
+                bank1_offset % chr_rom_size.max(1),
+            );
+        }
+    }
+
     /// Set controller 1 button state.
     ///
     /// Button bits (directly map to NES controller shift register order):
@@ -582,6 +817,10 @@ impl Bus {
 
 fn cartridge_uses_mmc1(cartridge: &Cartridge) -> bool {
     cartridge.mapper == 1
+}
+
+fn cartridge_uses_mmc3(cartridge: &Cartridge) -> bool {
+    cartridge.mapper == 4
 }
 
 // Implementing Default trait for convenience
