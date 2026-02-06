@@ -1141,6 +1141,23 @@ impl Ppu {
         nmi
     }
 
+    /// Check if PPU address line A12 rose (for MMC3 IRQ counter).
+    ///
+    /// A12 typically rises when switching between pattern tables during rendering.
+    /// This is used by MMC3 to clock its scanline counter.
+    /// Returns true if A12 transitioned from low to high.
+    ///
+    /// Simplified implementation: trigger once per scanline during rendering.
+    pub fn check_a12_rise(&mut self) -> bool {
+        // During rendering (scanlines 0-239 and pre-render 261),
+        // A12 changes when fetching sprite vs background pattern data
+        // For MMC3 IRQ purposes, trigger once per scanline
+        if (self.scanline < 240 || self.scanline == 261) && self.cycle == 260 && self.rendering_enabled() {
+            return true;
+        }
+        false
+    }
+
     /// Get the current frame number.
     #[allow(dead_code)] // Will be used for debugging and timing
     pub fn frame_number(&self) -> u64 {

@@ -129,6 +129,33 @@ impl Cpu {
         self.cycles += 7;
     }
 
+    /// Handle IRQ (Interrupt Request).
+    ///
+    /// This is called when an IRQ is triggered (e.g., by MMC3 scanline counter).
+    /// Unlike NMI, IRQ can be disabled by the I flag in the status register.
+    /// The CPU pushes PC and status to stack, then jumps to the IRQ handler.
+    pub fn irq(&mut self) {
+        // Check if interrupts are disabled
+        if (self.status & INTERRUPT_DISABLE) != 0 {
+            return;
+        }
+
+        // Push PC (high byte first, then low byte)
+        self.stack_push_u16(self.pc);
+
+        // Push status (with B flag clear, unused flag set)
+        self.stack_push(self.status & !BREAK | UNUSED);
+
+        // Set interrupt disable flag
+        self.status |= INTERRUPT_DISABLE;
+
+        // Load PC from IRQ vector at $FFFE-$FFFF
+        self.pc = self.bus.read_u16(0xFFFE);
+
+        // IRQ takes 7 cycles
+        self.cycles += 7;
+    }
+
     /// Execute one instruction and return the number of cycles it took.
     ///
     /// # Returns

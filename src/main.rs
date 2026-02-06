@@ -89,6 +89,13 @@ impl EmulatorApp {
 
                 // Step PPU 3 times for each CPU cycle (PPU runs at 3x CPU speed)
                 for _ in 0..(cpu_cycles * 3) {
+                    // Check for MMC3 IRQ (A12 rise during rendering)
+                    if cpu.bus.ppu.check_a12_rise() {
+                        if cpu.bus.mmc3_clock_irq() {
+                            cpu.irq();
+                        }
+                    }
+
                     if cpu.bus.ppu.step() {
                         // Frame completed
                         // Get the framebuffer from PPU and render it

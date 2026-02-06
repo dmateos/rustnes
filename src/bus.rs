@@ -799,6 +799,36 @@ impl Bus {
         }
     }
 
+    /// Clock the MMC3 IRQ counter (called when A12 rises).
+    ///
+    /// Returns true if an IRQ should be triggered.
+    pub fn mmc3_clock_irq(&mut self) -> bool {
+        let Some(ref mut mmc3) = self.mmc3 else {
+            return false;
+        };
+
+        // If reload flag is set, reload counter
+        if mmc3.irq_reload {
+            mmc3.irq_counter = mmc3.irq_latch;
+            mmc3.irq_reload = false;
+            return false;
+        }
+
+        // Decrement counter
+        if mmc3.irq_counter == 0 {
+            mmc3.irq_counter = mmc3.irq_latch;
+
+            // Trigger IRQ if enabled
+            if mmc3.irq_enabled {
+                return true;
+            }
+        } else {
+            mmc3.irq_counter -= 1;
+        }
+
+        false
+    }
+
     /// Set controller 1 button state.
     ///
     /// Button bits (directly map to NES controller shift register order):
