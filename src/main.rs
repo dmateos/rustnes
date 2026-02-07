@@ -1,3 +1,4 @@
+mod apu;
 mod bus;
 mod cartridge;
 mod cpu;
@@ -6,8 +7,12 @@ mod ppu;
 use bus::Bus;
 use cartridge::Cartridge;
 use cpu::Cpu;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Stream;
 use pixels::{Pixels, SurfaceTexture};
 use std::env;
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -36,6 +41,8 @@ struct EmulatorApp {
     cpu: Option<Cpu>,
     /// Current controller 1 button state
     controller1: u8,
+    /// Audio output stream (kept alive for audio playback)
+    _audio_stream: Option<Stream>,
 }
 
 impl EmulatorApp {
@@ -45,11 +52,120 @@ impl EmulatorApp {
             pixels: None,
             cpu: None,
             controller1: 0,
+            _audio_stream: None,
         }
     }
 
     fn set_cpu(&mut self, cpu: Cpu) {
         self.cpu = Some(cpu);
+    }
+
+    /// Initialize audio output stream.
+    ///
+    /// Creates a cpal audio stream that pulls samples from the APU's sample buffer.
+    fn init_audio(&mut self, sample_buffer: Arc<Mutex<VecDeque<f32>>>) {
+        // Get default audio output device
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("No audio output device available");
+                return;
+            }
+        };
+
+        // Use default output config
+        let config = match device.default_output_config() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to get audio config: {}", e);
+                return;
+            }
+        };
+
+        println!("Audio output: {} Hz, {} channels", config.sample_rate().0, config.channels());
+
+        // Build the audio stream
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => self.build_audio_stream::<f32>(&device, &config.into(), sample_buffer),
+            cpal::SampleFormat::I16 => self.build_audio_stream::<i16>(&device, &config.into(), sample_buffer),
+            cpal::SampleFormat::U16 => self.build_audio_stream::<u16>(&device, &config.into(), sample_buffer),
+            _ => {
+                eprintln!("Unsupported audio sample format");
+                return;
+            }
+        };
+
+        // Start playback
+        if let Some(ref stream) = stream {
+            if let Err(e) = stream.play() {
+                eprintln!("Failed to start audio stream: {}", e);
+                return;
+            }
+            println!("Audio stream started successfully");
+        }
+
+        self._audio_stream = stream;
+    }
+
+    /// Build an audio stream for a specific sample format.
+    fn build_audio_stream<T>(
+        &self,
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        sample_buffer: Arc<Mutex<VecDeque<f32>>>,
+    ) -> Option<Stream>
+    where
+        T: cpal::Sample + cpal::SizedSample + cpal::FromSample<f32>,
+    {
+        let channels = config.channels as usize;
+
+        // Track last sample to avoid discontinuities when buffer is empty
+        let mut last_sample = 0.0f32;
+
+        let stream = device.build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                // Fill output buffer with samples from APU
+                if let Ok(mut buffer) = sample_buffer.lock() {
+                    // Wait for buffer to warm up (at least 512 samples ~10ms at 48kHz)
+                    // to prevent initial underruns
+                    if buffer.len() < 512 {
+                        // Output silence during warmup
+                        for frame in data.chunks_mut(channels) {
+                            let value: T = cpal::Sample::from_sample(0.0f32);
+                            for out in frame.iter_mut() {
+                                *out = value;
+                            }
+                        }
+                        return;
+                    }
+
+                    for frame in data.chunks_mut(channels) {
+                        // Get next sample from buffer, or hold last sample if buffer is empty
+                        // This prevents pops from discontinuities
+                        let sample = buffer.pop_front().unwrap_or(last_sample);
+                        last_sample = sample;
+
+                        // Convert to output format and duplicate for all channels
+                        let value: T = cpal::Sample::from_sample(sample);
+                        for out in frame.iter_mut() {
+                            *out = value;
+                        }
+                    }
+                }
+            },
+            |err| eprintln!("Audio stream error: {}", err),
+            None,
+        );
+
+        match stream {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("Failed to build audio stream: {}", e);
+                None
+            }
+        }
     }
 
     /// Map a key code to controller button mask
@@ -84,8 +200,18 @@ impl EmulatorApp {
                     cpu.nmi();
                 }
 
+                // Check for IRQ from APU frame counter
+                if cpu.bus.apu.poll_irq() {
+                    cpu.irq();
+                }
+
                 // Step CPU once and get cycles consumed
                 let cpu_cycles = cpu.step();
+
+                // Step APU for each CPU cycle (APU runs at CPU speed)
+                for _ in 0..cpu_cycles {
+                    cpu.bus.apu.step();
+                }
 
                 // Step PPU 3 times for each CPU cycle (PPU runs at 3x CPU speed)
                 for _ in 0..(cpu_cycles * 3) {
@@ -254,7 +380,21 @@ fn main() {
     // Create event loop and application
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let mut app = EmulatorApp::new();
+
+    // Configure APU sample rate to match audio device
+    let host = cpal::default_host();
+    if let Some(device) = host.default_output_device() {
+        if let Ok(config) = device.default_output_config() {
+            let sample_rate = config.sample_rate().0 as f64;
+            cpu.bus.apu.set_sample_rate(sample_rate);
+        }
+    }
+
+    // Get sample buffer reference before moving CPU
+    let sample_buffer = cpu.bus.apu.get_sample_buffer();
+
     app.set_cpu(cpu);
+    app.init_audio(sample_buffer);
 
     // Run the application
     event_loop

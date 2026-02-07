@@ -15,6 +15,7 @@
 //! $4020-$FFFF: Cartridge space (PRG ROM/RAM, mapper registers)
 //! ```
 
+use crate::apu::Apu;
 use crate::cartridge::{Cartridge, Mirroring};
 use crate::ppu::Ppu;
 
@@ -123,8 +124,9 @@ pub struct Bus {
 
     /// MMC3 mapper state (if cartridge uses mapper 4)
     mmc3: Option<Mmc3>,
-    // TODO: Add APU when implemented
-    // apu: Apu,
+
+    /// APU (Audio Processing Unit)
+    pub apu: Apu,
 
     /// Controller 1 button states (directly set by input handling)
     /// Bits: A, B, Select, Start, Up, Down, Left, Right
@@ -159,6 +161,7 @@ impl Bus {
             ppu,
             mmc1: None,
             mmc3: None,
+            apu: Apu::new(),
             controller1_state: 0,
             controller1_shift: 0,
             controller_strobe: false,
@@ -194,6 +197,7 @@ impl Bus {
             ppu,
             mmc1: if uses_mmc1 { Some(Mmc1::new()) } else { None },
             mmc3: if uses_mmc3 { Some(Mmc3::new()) } else { None },
+            apu: Apu::new(),
             controller1_state: 0,
             controller1_shift: 0,
             controller_strobe: false,
@@ -239,8 +243,7 @@ impl Bus {
 
             // APU and I/O registers ($4000-$4017)
             0x4000..=0x4013 | 0x4015 => {
-                // TODO: Implement APU and I/O reads
-                0
+                self.apu.read_register((address - 0x4000) as u8)
             }
 
             // OAMDMA ($4014) is write-only; reads typically return open bus (0 here)
@@ -330,7 +333,7 @@ impl Bus {
 
             // APU and I/O registers ($4000-$4017)
             0x4000..=0x4013 | 0x4015 => {
-                // TODO: Implement APU and I/O writes
+                self.apu.write_register((address - 0x4000) as u8, value);
             }
 
             // OAMDMA - sprite DMA ($4014)
@@ -355,8 +358,10 @@ impl Bus {
                 self.controller_strobe = new_strobe;
             }
 
-            // $4017 is APU frame counter, ignore for now
-            0x4017 => {}
+            // $4017 - APU frame counter
+            0x4017 => {
+                self.apu.write_register(0x17, value);
+            }
 
             // APU and I/O functionality that is normally disabled ($4018-$401F)
             0x4018..=0x401F => {
