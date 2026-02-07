@@ -9,6 +9,7 @@ use cartridge::Cartridge;
 use cpu::Cpu;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
+use font8x8::{UnicodeFonts, BASIC_FONTS};
 use pixels::{Pixels, SurfaceTexture};
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -186,41 +187,6 @@ impl EmulatorApp {
         }
     }
 
-    /// Simple 5x7 bitmap font for debug overlay
-    fn get_char_bitmap(ch: char) -> &'static [u8; 7] {
-        match ch {
-            '0' => &[0x7E, 0x81, 0x89, 0x95, 0xA1, 0x81, 0x7E],
-            '1' => &[0x00, 0x82, 0xFF, 0x80, 0x00, 0x00, 0x00],
-            '2' => &[0x82, 0xC1, 0xA1, 0x91, 0x89, 0x85, 0x82],
-            '3' => &[0x42, 0x81, 0x89, 0x89, 0x89, 0x89, 0x76],
-            '4' => &[0x18, 0x28, 0x48, 0x88, 0xFF, 0x08, 0x08],
-            '5' => &[0xE7, 0x85, 0x85, 0x85, 0x85, 0x85, 0x79],
-            '6' => &[0x7E, 0x89, 0x89, 0x89, 0x89, 0x89, 0x72],
-            '7' => &[0xC0, 0xC0, 0xA1, 0x91, 0x89, 0x85, 0x83],
-            '8' => &[0x76, 0x89, 0x89, 0x89, 0x89, 0x89, 0x76],
-            '9' => &[0x86, 0x89, 0x89, 0x89, 0x89, 0x89, 0x7E],
-            'A' => &[0x3F, 0x48, 0x88, 0x88, 0x88, 0x48, 0x3F],
-            'B' => &[0xFF, 0x89, 0x89, 0x89, 0x89, 0x89, 0x76],
-            'C' => &[0x7E, 0x81, 0x81, 0x81, 0x81, 0x81, 0x42],
-            'D' => &[0xFF, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C],
-            'E' => &[0xFF, 0x89, 0x89, 0x89, 0x89, 0x89, 0x81],
-            'F' => &[0xFF, 0x88, 0x88, 0x88, 0x88, 0x88, 0x80],
-            'N' => &[0xFF, 0x02, 0x04, 0x08, 0x10, 0x20, 0xFF],
-            'O' => &[0x7E, 0x81, 0x81, 0x81, 0x81, 0x81, 0x7E],
-            'P' => &[0xFF, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70],
-            'S' => &[0x46, 0x89, 0x89, 0x89, 0x89, 0x89, 0x71],
-            'V' => &[0xC0, 0x20, 0x10, 0x0F, 0x10, 0x20, 0xC0],
-            'X' => &[0xC3, 0x24, 0x18, 0x18, 0x18, 0x24, 0xC3],
-            'Y' => &[0xC0, 0x20, 0x10, 0x0F, 0x10, 0x20, 0xC0],
-            'a' | 'b' | 'c' | 'd' | 'i' | 'n' | 'v' | 'z' => &[0x00, 0x3A, 0x45, 0x45, 0x45, 0x3D, 0x00], // Simple lowercase
-            ':' => &[0x00, 0x00, 0x36, 0x36, 0x00, 0x00, 0x00],
-            '~' => &[0x08, 0x10, 0x10, 0x08, 0x08, 0x10, 0x00],
-            '$' => &[0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x00, 0x00],
-            ' ' => &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '-' => &[0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00],
-            _ => &[0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF], // Box for unknown chars
-        }
-    }
 
     /// Draws a semi-transparent debug overlay on the pixel buffer
     fn draw_debug_overlay(frame: &mut [u8], cpu: &mut Cpu) {
@@ -239,27 +205,28 @@ impl EmulatorApp {
             }
         }
 
-        // Helper to draw text using bitmap font
+        // Helper to draw text using font8x8 bitmap font
         let mut draw_text = |text: &str, x: usize, y: usize, r: u8, g: u8, b: u8| {
             for (i, ch) in text.chars().enumerate() {
-                let char_x = x + (i * 6); // 5 pixels wide + 1 pixel spacing
-                if char_x + 8 < SCREEN_WIDTH as usize && y + 7 < SCREEN_HEIGHT as usize {
-                    let bitmap = Self::get_char_bitmap(ch);
+                let char_x = x + (i * 8); // 8 pixels wide per character
+                if char_x + 8 <= SCREEN_WIDTH as usize && y + 8 <= SCREEN_HEIGHT as usize {
+                    // Get the glyph from font8x8 library
+                    if let Some(glyph) = BASIC_FONTS.get(ch) {
+                        // Draw each row of the 8x8 character
+                        for (row, &byte) in glyph.iter().enumerate() {
+                            // Draw 8 pixels per row (checking each bit)
+                            for col in 0..8 {
+                                if (byte & (1 << col)) != 0 {
+                                    let px = char_x + col;
+                                    let py = y + row;
+                                    let offset = ((py * SCREEN_WIDTH as usize) + px) * 4;
 
-                    // Draw each row of the character
-                    for (row, &byte) in bitmap.iter().enumerate() {
-                        // Draw 8 pixels per row (checking each bit)
-                        for col in 0..8 {
-                            if (byte & (1 << (7 - col))) != 0 {
-                                let px = char_x + col;
-                                let py = y + row;
-                                let offset = ((py * SCREEN_WIDTH as usize) + px) * 4;
-
-                                if offset + 3 < frame.len() {
-                                    frame[offset] = r;
-                                    frame[offset + 1] = g;
-                                    frame[offset + 2] = b;
-                                    frame[offset + 3] = 255;
+                                    if offset + 3 < frame.len() {
+                                        frame[offset] = r;
+                                        frame[offset + 1] = g;
+                                        frame[offset + 2] = b;
+                                        frame[offset + 3] = 255;
+                                    }
                                 }
                             }
                         }
