@@ -43,6 +43,8 @@ struct EmulatorApp {
     controller1: u8,
     /// Audio output stream (kept alive for audio playback)
     _audio_stream: Option<Stream>,
+    /// Show debug overlay (toggle with ~)
+    show_debug: bool,
 }
 
 impl EmulatorApp {
@@ -53,6 +55,7 @@ impl EmulatorApp {
             cpu: None,
             controller1: 0,
             _audio_stream: None,
+            show_debug: false,
         }
     }
 
@@ -183,6 +186,84 @@ impl EmulatorApp {
         }
     }
 
+    /// Draws a semi-transparent debug overlay on the pixel buffer
+    fn draw_debug_overlay(frame: &mut [u8], cpu: &mut Cpu) {
+        // Draw a semi-transparent dark background box for the debug info
+        // Box position: x=5, y=5, width=120, height=80
+        for y in 5..85 {
+            for x in 5..125 {
+                let offset = ((y * SCREEN_WIDTH as usize) + x) * 4;
+                if offset + 3 < frame.len() {
+                    // Darken the background (semi-transparent black)
+                    frame[offset] = frame[offset] / 3;         // R
+                    frame[offset + 1] = frame[offset + 1] / 3; // G
+                    frame[offset + 2] = frame[offset + 2] / 3; // B
+                    frame[offset + 3] = 255;                   // A
+                }
+            }
+        }
+
+        // Helper to draw a simple text line (very basic - just colored pixels for now)
+        let mut draw_text = |text: &str, x: usize, y: usize, r: u8, g: u8, b: u8| {
+            for (i, ch) in text.chars().enumerate() {
+                let char_x = x + (i * 6);
+                if char_x + 4 < SCREEN_WIDTH as usize && y + 7 < SCREEN_HEIGHT as usize {
+                    // Draw a simple 4x7 pixel representation
+                    for py in 0..7 {
+                        for px in 0..4 {
+                            let offset = (((y + py) * SCREEN_WIDTH as usize) + char_x + px) * 4;
+                            if offset + 3 < frame.len() {
+                                // Simple pattern based on character (very basic!)
+                                let should_draw = match ch {
+                                    '0'..='9' | 'A'..='F' | 'a'..='f' => (px + py) % 2 == 0,
+                                    ':' => px == 1 && (py == 2 || py == 4),
+                                    '$' => px == 1 || py == 3,
+                                    ' ' => false,
+                                    _ => px == 0 || py == 0,
+                                };
+
+                                if should_draw {
+                                    frame[offset] = r;
+                                    frame[offset + 1] = g;
+                                    frame[offset + 2] = b;
+                                    frame[offset + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // Draw CPU state
+        draw_text(&format!("A:{:02X} X:{:02X} Y:{:02X}", cpu.a, cpu.x, cpu.y), 8, 8, 0, 255, 0);
+        draw_text(&format!("PC:{:04X} SP:{:02X}", cpu.pc, cpu.sp), 8, 18, 0, 255, 0);
+
+        // Draw flags
+        let flags = cpu.status;
+        let flag_str = format!("{}{}{}{}{}{}{}{}",
+            if flags & 0x80 != 0 { 'N' } else { 'n' },
+            if flags & 0x40 != 0 { 'V' } else { 'v' },
+            if flags & 0x10 != 0 { 'B' } else { 'b' },
+            if flags & 0x08 != 0 { 'D' } else { 'd' },
+            if flags & 0x04 != 0 { 'I' } else { 'i' },
+            if flags & 0x02 != 0 { 'Z' } else { 'z' },
+            if flags & 0x01 != 0 { 'C' } else { 'c' },
+            ' '
+        );
+        draw_text(&flag_str, 8, 28, 255, 255, 0);
+
+        // Draw next instruction
+        let opcode = cpu.bus.read(cpu.pc);
+        draw_text(&format!("OP:{:02X}", opcode), 8, 38, 255, 128, 0);
+
+        // Draw cycle count (truncated)
+        draw_text(&format!("CY:{}", cpu.cycles % 1000000), 8, 48, 128, 128, 255);
+
+        // Draw hint
+        draw_text("~ to hide", 8, 68, 100, 100, 100);
+    }
+
     fn render_frame(&mut self) {
         if let (Some(cpu), Some(pixels)) = (&mut self.cpu, &mut self.pixels) {
             // Update controller state
@@ -230,6 +311,11 @@ impl EmulatorApp {
 
                         // Copy RGBA data to pixels buffer
                         frame.copy_from_slice(&framebuffer_rgba);
+
+                        // Draw debug overlay if enabled
+                        if self.show_debug {
+                            Self::draw_debug_overlay(frame, cpu);
+                        }
 
                         // Render to window
                         if let Err(e) = pixels.render() {
@@ -302,6 +388,12 @@ impl ApplicationHandler for EmulatorApp {
                     // Handle escape to exit
                     if key == KeyCode::Escape && event.state == ElementState::Pressed {
                         event_loop.exit();
+                        return;
+                    }
+
+                    // Toggle debug overlay with ~ (backquote)
+                    if key == KeyCode::Backquote && event.state == ElementState::Pressed {
+                        self.show_debug = !self.show_debug;
                         return;
                     }
 

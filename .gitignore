@@ -1,0 +1,7 @@
+/target/
+*.nes
+.DS_Store
+._.DS_Store
+._*
+.claude/
+Cargo.lock
