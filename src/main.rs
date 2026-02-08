@@ -46,6 +46,10 @@ struct EmulatorApp {
     _audio_stream: Option<Stream>,
     /// Show debug overlay (toggle with ~)
     show_debug: bool,
+    /// Speed multiplier (1.0 = normal, 0.001 = ~1Hz, 10.0 = 10x speed)
+    speed_multiplier: f64,
+    /// Accumulated cycles for speed control
+    cycle_debt: f64,
 }
 
 impl EmulatorApp {
@@ -57,6 +61,8 @@ impl EmulatorApp {
             controller1: 0,
             _audio_stream: None,
             show_debug: false,
+            speed_multiplier: 1.0, // Start at normal speed
+            cycle_debt: 0.0,
         }
     }
 
@@ -189,11 +195,11 @@ impl EmulatorApp {
 
 
     /// Draws a semi-transparent debug overlay on the pixel buffer
-    fn draw_debug_overlay(frame: &mut [u8], cpu: &mut Cpu) {
+    fn draw_debug_overlay(frame: &mut [u8], cpu: &mut Cpu, speed_multiplier: f64) {
         // Draw a semi-transparent dark background box for the debug info
-        // Box position: x=5, y=5, width=120, height=80
-        for y in 5..85 {
-            for x in 5..125 {
+        // Box position: x=5, y=5, width=200, height=105 (expanded for speed info)
+        for y in 5..110 {
+            for x in 5..205 {
                 let offset = ((y * SCREEN_WIDTH as usize) + x) * 4;
                 if offset + 3 < frame.len() {
                     // Darken the background (semi-transparent black)
@@ -260,8 +266,21 @@ impl EmulatorApp {
         // Draw cycle count (truncated)
         draw_text(&format!("CY:{}", cpu.cycles % 1000000), 8, 48, 128, 128, 255);
 
-        // Draw hint
-        draw_text("~ to hide", 8, 68, 100, 100, 100);
+        // Draw speed multiplier
+        let speed_text = if speed_multiplier == 0.0 {
+            "SPD:PAUSED".to_string()
+        } else if speed_multiplier < 0.001 {
+            format!("SPD:~{}Hz", (1_790_000.0 * speed_multiplier) as u32)
+        } else {
+            format!("SPD:{:.2}x", speed_multiplier)
+        };
+        draw_text(&speed_text, 8, 58, 0, 255, 255);
+
+        // Draw hints
+        draw_text("~ hide", 8, 73, 100, 100, 100);
+        draw_text("- slow  + fast", 8, 83, 100, 100, 100);
+        draw_text("[ 1Hz   ] norm", 8, 93, 100, 100, 100);
+        draw_text("0 pause", 8, 103, 100, 100, 100);
     }
 
     fn render_frame(&mut self) {
@@ -273,6 +292,31 @@ impl EmulatorApp {
             let mut nmi_triggered = false;
 
             loop {
+                // Apply speed control - accumulate cycles based on speed multiplier
+                self.cycle_debt += self.speed_multiplier;
+
+                // Only execute CPU steps if we have enough accumulated cycles
+                if self.cycle_debt < 1.0 {
+                    // Not enough cycles accumulated yet, skip execution
+                    // But still render the current state at 60 FPS for smooth debug overlay updates
+                    let framebuffer_rgba = cpu.bus.ppu.get_framebuffer_rgba();
+                    let frame = pixels.frame_mut();
+                    frame.copy_from_slice(&framebuffer_rgba);
+
+                    if self.show_debug {
+                        Self::draw_debug_overlay(frame, cpu, self.speed_multiplier);
+                    }
+
+                    if let Err(e) = pixels.render() {
+                        eprintln!("Render error: {}", e);
+                    }
+
+                    return; // Don't execute any cycles this frame
+                }
+
+                // Consume one cycle from the debt
+                self.cycle_debt -= 1.0;
+
                 // Check for NMI from PPU
                 if cpu.bus.ppu.poll_nmi() {
                     if !nmi_triggered {
@@ -314,7 +358,7 @@ impl EmulatorApp {
 
                         // Draw debug overlay if enabled
                         if self.show_debug {
-                            Self::draw_debug_overlay(frame, cpu);
+                            Self::draw_debug_overlay(frame, cpu, self.speed_multiplier);
                         }
 
                         // Render to window
@@ -395,6 +439,43 @@ impl ApplicationHandler for EmulatorApp {
                     if key == KeyCode::Backquote && event.state == ElementState::Pressed {
                         self.show_debug = !self.show_debug;
                         return;
+                    }
+
+                    // Speed controls
+                    if event.state == ElementState::Pressed {
+                        match key {
+                            KeyCode::Minus => {
+                                // Decrease speed (halve it)
+                                self.speed_multiplier = (self.speed_multiplier * 0.5).max(0.0001);
+                                println!("Speed: {:.4}x", self.speed_multiplier);
+                                return;
+                            }
+                            KeyCode::Equal => {
+                                // Increase speed (double it)
+                                self.speed_multiplier = (self.speed_multiplier * 2.0).min(10.0);
+                                println!("Speed: {:.4}x", self.speed_multiplier);
+                                return;
+                            }
+                            KeyCode::BracketLeft => {
+                                // Very slow (1Hz debug mode)
+                                self.speed_multiplier = 0.00056; // ~1Hz (1.79M / 0.00056 ≈ 1)
+                                println!("Speed: ~1 Hz (debug mode)");
+                                return;
+                            }
+                            KeyCode::BracketRight => {
+                                // Normal speed
+                                self.speed_multiplier = 1.0;
+                                println!("Speed: 1.0x (normal)");
+                                return;
+                            }
+                            KeyCode::Digit0 => {
+                                // Pause
+                                self.speed_multiplier = 0.0;
+                                println!("Speed: PAUSED");
+                                return;
+                            }
+                            _ => {}
+                        }
                     }
 
                     // Handle controller buttons
