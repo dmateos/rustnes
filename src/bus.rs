@@ -99,6 +99,50 @@ impl Mmc3 {
     }
 }
 
+/// UxROM mapper state (Mapper 2) - used by Mega Man, Castlevania, Contra.
+/// Simple PRG bank switching, CHR-RAM (no CHR banking).
+struct UxRom {
+    /// PRG bank select (written to $8000-$FFFF)
+    prg_bank: u8,
+}
+
+impl UxRom {
+    fn new() -> Self {
+        UxRom { prg_bank: 0 }
+    }
+}
+
+/// CNROM mapper state (Mapper 3) - simple CHR bank switching.
+/// Used by many early games like Gradius, Solomon's Key.
+struct CnRom {
+    /// CHR bank select (written to $8000-$FFFF)
+    chr_bank: u8,
+}
+
+impl CnRom {
+    fn new() -> Self {
+        CnRom { chr_bank: 0 }
+    }
+}
+
+/// AxROM mapper state (Mapper 7) - used by Battletoads, Wizards & Warriors.
+/// PRG bank switching with one-screen mirroring control.
+struct AxRom {
+    /// PRG bank select (bits 0-2 of value written to $8000-$FFFF)
+    prg_bank: u8,
+    /// One-screen mirroring select (bit 4: 0=lower, 1=upper)
+    mirroring: u8,
+}
+
+impl AxRom {
+    fn new() -> Self {
+        AxRom {
+            prg_bank: 0,
+            mirroring: 0,
+        }
+    }
+}
+
 /// NES CPU memory bus.
 ///
 /// The bus owns all the components and handles memory-mapped I/O.
@@ -122,8 +166,17 @@ pub struct Bus {
     /// MMC1 mapper state (if cartridge uses mapper 1)
     mmc1: Option<Mmc1>,
 
+    /// UxROM mapper state (if cartridge uses mapper 2)
+    uxrom: Option<UxRom>,
+
+    /// CNROM mapper state (if cartridge uses mapper 3)
+    cnrom: Option<CnRom>,
+
     /// MMC3 mapper state (if cartridge uses mapper 4)
     mmc3: Option<Mmc3>,
+
+    /// AxROM mapper state (if cartridge uses mapper 7)
+    axrom: Option<AxRom>,
 
     /// APU (Audio Processing Unit)
     pub apu: Apu,
@@ -160,7 +213,10 @@ impl Bus {
             cartridge: None,
             ppu,
             mmc1: None,
+            uxrom: None,
+            cnrom: None,
             mmc3: None,
+            axrom: None,
             apu: Apu::new(),
             controller1_state: 0,
             controller1_shift: 0,
@@ -187,16 +243,18 @@ impl Bus {
         let chr_rom = cartridge.chr_rom.clone();
         let mirroring = cartridge.mirroring;
         let ppu = Ppu::new(chr_rom, mirroring);
-        let uses_mmc1 = cartridge_uses_mmc1(&cartridge);
-        let uses_mmc3 = cartridge_uses_mmc3(&cartridge);
+        let mapper = cartridge.mapper;
 
         Bus {
             ram: [0; RAM_SIZE],
             prg_ram: [0; 8192],
             cartridge: Some(cartridge),
             ppu,
-            mmc1: if uses_mmc1 { Some(Mmc1::new()) } else { None },
-            mmc3: if uses_mmc3 { Some(Mmc3::new()) } else { None },
+            mmc1: if mapper == 1 { Some(Mmc1::new()) } else { None },
+            uxrom: if mapper == 2 { Some(UxRom::new()) } else { None },
+            cnrom: if mapper == 3 { Some(CnRom::new()) } else { None },
+            mmc3: if mapper == 4 { Some(Mmc3::new()) } else { None },
+            axrom: if mapper == 7 { Some(AxRom::new()) } else { None },
             apu: Apu::new(),
             controller1_state: 0,
             controller1_shift: 0,
@@ -381,11 +439,14 @@ impl Bus {
 
             // Cartridge space ($4020-$FFFF)
             0x8000..=0xFFFF => {
-                // Mapper writes (e.g., MMC1 bank switching)
+                // Mapper writes (e.g., bank switching)
                 if let Some(ref cartridge) = self.cartridge {
                     match cartridge.mapper {
                         1 => self.mmc1_write(address, value),
+                        2 => self.uxrom_write(value),
+                        3 => self.cnrom_write(value),
                         4 => self.mmc3_write(address, value),
+                        7 => self.axrom_write(value),
                         _ => {
                             // Other mappers not yet implemented
                         }
@@ -440,10 +501,25 @@ impl Bus {
             // Mapper 1 (MMC1)
             1 => self.read_prg_mmc1(address, cartridge),
 
+            // Mapper 2 (UxROM)
+            2 => self.read_prg_uxrom(address, cartridge),
+
+            // Mapper 3 (CNROM) - no PRG banking, simple linear access
+            3 => {
+                if rom_address < cartridge.prg_rom.len() {
+                    cartridge.prg_rom[rom_address]
+                } else {
+                    0
+                }
+            }
+
             // Mapper 4 (MMC3)
             4 => self.read_prg_mmc3(address, cartridge),
 
-            // Other mappers - TODO: implement as needed
+            // Mapper 7 (AxROM)
+            7 => self.read_prg_axrom(address, cartridge),
+
+            // Other mappers - not implemented
             _ => {
                 // For now, just do simple linear mapping
                 if rom_address < cartridge.prg_rom.len() {
@@ -561,6 +637,54 @@ impl Bus {
         };
 
         let physical_address = (bank_num * bank_size_8k) + offset_in_bank;
+        cartridge.prg_rom.get(physical_address).copied().unwrap_or(0)
+    }
+
+    fn read_prg_uxrom(&self, address: u16, cartridge: &Cartridge) -> u8 {
+        let Some(ref uxrom) = self.uxrom else {
+            // Fallback: simple linear mapping
+            let rom_address = (address - 0x8000) as usize;
+            return cartridge.prg_rom.get(rom_address).copied().unwrap_or(0);
+        };
+
+        let prg_rom_size = cartridge.prg_rom.len();
+        let bank_size = 0x4000; // 16KB
+        let bank_count = prg_rom_size / bank_size;
+
+        match address {
+            // First bank: switchable
+            0x8000..=0xBFFF => {
+                let bank = (uxrom.prg_bank as usize) % bank_count.max(1);
+                let offset = (address - 0x8000) as usize;
+                let physical_address = (bank * bank_size) + offset;
+                cartridge.prg_rom.get(physical_address).copied().unwrap_or(0)
+            }
+            // Second bank: fixed to last bank
+            0xC000..=0xFFFF => {
+                let bank = bank_count.saturating_sub(1);
+                let offset = (address - 0xC000) as usize;
+                let physical_address = (bank * bank_size) + offset;
+                cartridge.prg_rom.get(physical_address).copied().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
+    fn read_prg_axrom(&self, address: u16, cartridge: &Cartridge) -> u8 {
+        let Some(ref axrom) = self.axrom else {
+            // Fallback: simple linear mapping
+            let rom_address = (address - 0x8000) as usize;
+            return cartridge.prg_rom.get(rom_address).copied().unwrap_or(0);
+        };
+
+        let prg_rom_size = cartridge.prg_rom.len();
+        let bank_size = 0x8000; // 32KB
+        let bank_count = prg_rom_size / bank_size;
+
+        // AxROM uses 32KB banks, entire $8000-$FFFF is switchable
+        let bank = (axrom.prg_bank as usize) % bank_count.max(1);
+        let offset = (address - 0x8000) as usize;
+        let physical_address = (bank * bank_size) + offset;
         cartridge.prg_rom.get(physical_address).copied().unwrap_or(0)
     }
 
@@ -844,6 +968,57 @@ impl Bus {
         false
     }
 
+    fn uxrom_write(&mut self, value: u8) {
+        if let Some(ref mut uxrom) = self.uxrom {
+            // UxROM: any write to $8000-$FFFF selects PRG bank
+            uxrom.prg_bank = value;
+        }
+    }
+
+    fn cnrom_write(&mut self, value: u8) {
+        if let Some(ref mut cnrom) = self.cnrom {
+            // CNROM: any write to $8000-$FFFF selects CHR bank
+            cnrom.chr_bank = value & 0x03; // Usually only 2 bits used
+
+            // Update PPU CHR banking
+            if let Some(ref cartridge) = self.cartridge {
+                let chr_rom_size = cartridge.chr_rom.len();
+                let bank_size = 0x2000; // 8KB
+                let bank = (cnrom.chr_bank as usize) % (chr_rom_size / bank_size).max(1);
+
+                // Set all 8 1KB banks to point to the selected 8KB bank
+                let base_offset = bank * bank_size;
+                let banks = [
+                    base_offset,
+                    base_offset + 0x400,
+                    base_offset + 0x800,
+                    base_offset + 0xC00,
+                    base_offset + 0x1000,
+                    base_offset + 0x1400,
+                    base_offset + 0x1800,
+                    base_offset + 0x1C00,
+                ];
+                self.ppu.set_chr_banks_1kb(banks);
+            }
+        }
+    }
+
+    fn axrom_write(&mut self, value: u8) {
+        if let Some(ref mut axrom) = self.axrom {
+            // AxROM: bits 0-2 select PRG bank, bit 4 selects one-screen mirroring
+            axrom.prg_bank = value & 0x07;
+            axrom.mirroring = (value >> 4) & 0x01;
+
+            // Update mirroring
+            let mirroring = if axrom.mirroring == 0 {
+                Mirroring::OneScreenLower
+            } else {
+                Mirroring::OneScreenUpper
+            };
+            self.ppu.set_mirroring(mirroring);
+        }
+    }
+
     /// Set controller 1 button state.
     ///
     /// Button bits (directly map to NES controller shift register order):
@@ -858,14 +1033,6 @@ impl Bus {
     pub fn set_controller1(&mut self, buttons: u8) {
         self.controller1_state = buttons;
     }
-}
-
-fn cartridge_uses_mmc1(cartridge: &Cartridge) -> bool {
-    cartridge.mapper == 1
-}
-
-fn cartridge_uses_mmc3(cartridge: &Cartridge) -> bool {
-    cartridge.mapper == 4
 }
 
 // Implementing Default trait for convenience
