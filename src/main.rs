@@ -1,19 +1,15 @@
-mod apu;
-mod bus;
-mod cartridge;
-mod cpu;
-mod ppu;
-
-use bus::Bus;
-use cartridge::Cartridge;
-use cpu::Cpu;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use pixels::{Pixels, SurfaceTexture};
+use rustnes::api::run_uds_server_shared;
+use rustnes::cartridge::Cartridge;
+use rustnes::cpu::Cpu;
+use rustnes::EmulatorCore;
 use std::env;
-use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -39,7 +35,7 @@ const BTN_RIGHT: u8 = 0x80;
 struct EmulatorApp {
     window_ref: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
-    cpu: Option<Cpu>,
+    core: Option<Arc<Mutex<EmulatorCore>>>,
     /// Current controller 1 button state
     controller1: u8,
     /// Audio output stream (kept alive for audio playback)
@@ -57,7 +53,7 @@ impl EmulatorApp {
         EmulatorApp {
             window_ref: None,
             pixels: None,
-            cpu: None,
+            core: None,
             controller1: 0,
             _audio_stream: None,
             show_debug: false,
@@ -66,8 +62,8 @@ impl EmulatorApp {
         }
     }
 
-    fn set_cpu(&mut self, cpu: Cpu) {
-        self.cpu = Some(cpu);
+    fn set_core(&mut self, core: Arc<Mutex<EmulatorCore>>) {
+        self.core = Some(core);
     }
 
     /// Initialize audio output stream.
@@ -284,91 +280,36 @@ impl EmulatorApp {
     }
 
     fn render_frame(&mut self) {
-        if let (Some(cpu), Some(pixels)) = (&mut self.cpu, &mut self.pixels) {
+        if let (Some(core), Some(pixels)) = (&self.core, &mut self.pixels) {
+            let Ok(mut core) = core.lock() else {
+                eprintln!("Failed to lock emulator core");
+                return;
+            };
+
             // Update controller state
-            cpu.bus.set_controller1(self.controller1);
+            core.set_controller1(self.controller1);
 
-            // Run emulation until a frame completes
-            let mut nmi_triggered = false;
+            // Apply speed control using frame units for shared core stepping.
+            self.cycle_debt += self.speed_multiplier;
 
-            loop {
-                // Apply speed control - accumulate cycles based on speed multiplier
-                self.cycle_debt += self.speed_multiplier;
-
-                // Only execute CPU steps if we have enough accumulated cycles
-                if self.cycle_debt < 1.0 {
-                    // Not enough cycles accumulated yet, skip execution
-                    // But still render the current state at 60 FPS for smooth debug overlay updates
-                    let framebuffer_rgba = cpu.bus.ppu.get_framebuffer_rgba();
-                    let frame = pixels.frame_mut();
-                    frame.copy_from_slice(&framebuffer_rgba);
-
-                    if self.show_debug {
-                        Self::draw_debug_overlay(frame, cpu, self.speed_multiplier);
-                    }
-
-                    if let Err(e) = pixels.render() {
-                        eprintln!("Render error: {}", e);
-                    }
-
-                    return; // Don't execute any cycles this frame
+            if self.cycle_debt >= 1.0 {
+                while self.cycle_debt >= 1.0 {
+                    core.step_until_frame();
+                    self.cycle_debt -= 1.0;
                 }
+            }
 
-                // Consume one cycle from the debt
-                self.cycle_debt -= 1.0;
+            let framebuffer_rgba = core.frame_rgba();
+            let frame = pixels.frame_mut();
+            frame.copy_from_slice(&framebuffer_rgba);
 
-                // Check for NMI from PPU
-                if cpu.bus.ppu.poll_nmi() {
-                    if !nmi_triggered {
-                        nmi_triggered = true;
-                    }
-                    cpu.nmi();
-                }
+            if self.show_debug {
+                let cpu = core.cpu_mut();
+                Self::draw_debug_overlay(frame, cpu, self.speed_multiplier);
+            }
 
-                // Check for IRQ from APU frame counter
-                if cpu.bus.apu.poll_irq() {
-                    cpu.irq();
-                }
-
-                // Step CPU once and get cycles consumed
-                let cpu_cycles = cpu.step();
-
-                // Step APU for each CPU cycle (APU runs at CPU speed)
-                for _ in 0..cpu_cycles {
-                    cpu.bus.apu.step();
-                }
-
-                // Step PPU 3 times for each CPU cycle (PPU runs at 3x CPU speed)
-                for _ in 0..(cpu_cycles * 3) {
-                    // Check for MMC3 IRQ (A12 rise during rendering)
-                    if cpu.bus.ppu.check_a12_rise() {
-                        if cpu.bus.mmc3_clock_irq() {
-                            cpu.irq();
-                        }
-                    }
-
-                    if cpu.bus.ppu.step() {
-                        // Frame completed
-                        // Get the framebuffer from PPU and render it
-                        let framebuffer_rgba = cpu.bus.ppu.get_framebuffer_rgba();
-                        let frame = pixels.frame_mut();
-
-                        // Copy RGBA data to pixels buffer
-                        frame.copy_from_slice(&framebuffer_rgba);
-
-                        // Draw debug overlay if enabled
-                        if self.show_debug {
-                            Self::draw_debug_overlay(frame, cpu, self.speed_multiplier);
-                        }
-
-                        // Render to window
-                        if let Err(e) = pixels.render() {
-                            eprintln!("Render error: {}", e);
-                        }
-
-                        return;
-                    }
-                }
+            if let Err(e) = pixels.render() {
+                eprintln!("Render error: {}", e);
             }
         }
     }
@@ -511,11 +452,30 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <rom_file.nes>", args[0]);
+        eprintln!("Usage: {} <rom_file.nes> [--api-socket <path>]", args[0]);
         std::process::exit(1);
     }
 
     let rom_path = &args[1];
+    let mut api_socket: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--api-socket" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --api-socket");
+                    std::process::exit(1);
+                }
+                api_socket = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("Unknown argument: {}", other);
+                eprintln!("Usage: {} <rom_file.nes> [--api-socket <path>]", args[0]);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Load the ROM
     let cartridge = match Cartridge::load(rom_path) {
@@ -541,13 +501,11 @@ fn main() {
         }
     };
 
-    // Create bus and CPU
-    let bus = Bus::with_cartridge(cartridge);
-    let mut cpu = Cpu::new(bus);
-    cpu.reset();
+    // Create shared emulator core
+    let mut core = EmulatorCore::from_cartridge(cartridge);
 
     println!("CPU initialized");
-    println!("Reset vector points to: ${:04X}", cpu.pc);
+    println!("Reset vector points to: ${:04X}", core.cpu().pc);
     println!("Starting emulation...");
 
     // Create event loop and application
@@ -559,14 +517,24 @@ fn main() {
     if let Some(device) = host.default_output_device() {
         if let Ok(config) = device.default_output_config() {
             let sample_rate = config.sample_rate().0 as f64;
-            cpu.bus.apu.set_sample_rate(sample_rate);
+            core.set_apu_sample_rate(sample_rate);
         }
     }
 
-    // Get sample buffer reference before moving CPU
-    let sample_buffer = cpu.bus.apu.get_sample_buffer();
+    // Get sample buffer reference before sharing core
+    let sample_buffer = core.cpu().bus.apu.get_sample_buffer();
+    let shared_core = Arc::new(Mutex::new(core));
 
-    app.set_cpu(cpu);
+    if let Some(socket_path) = api_socket {
+        let api_core = Arc::clone(&shared_core);
+        thread::spawn(move || {
+            if let Err(err) = run_uds_server_shared(socket_path, api_core) {
+                eprintln!("UDS API server error: {}", err);
+            }
+        });
+    }
+
+    app.set_core(shared_core);
     app.init_audio(sample_buffer);
 
     // Run the application

@@ -162,53 +162,6 @@ impl Cpu {
     ///
     /// The number of CPU cycles the instruction took to execute
     pub fn step(&mut self) -> u8 {
-        // Debug: Detect when CPU exits wait loop and show what's executing inside
-        static mut IN_WAIT_LOOP: bool = false;
-        static mut LOOP_INSTRUCTION_COUNT: u32 = 0;
-        unsafe {
-            if self.pc >= 0xFF5A && self.pc <= 0xFF5F {
-                if !IN_WAIT_LOOP {
-                    println!("*** CPU ENTERED WAIT LOOP at ${:04X} ***", self.pc);
-                    IN_WAIT_LOOP = true;
-                    LOOP_INSTRUCTION_COUNT = 0;
-                }
-
-                // Show first 20 instructions in wait loop to see the pattern
-                LOOP_INSTRUCTION_COUNT += 1;
-                let count = LOOP_INSTRUCTION_COUNT;
-                if count <= 20 {
-                    println!(
-                        "  Loop[{}] ${:04X}: {:02X} (A=${:02X} X=${:02X} Y=${:02X} P=${:02X})",
-                        count,
-                        self.pc,
-                        self.bus.read(self.pc),
-                        self.a,
-                        self.x,
-                        self.y,
-                        self.status
-                    );
-                }
-            } else if IN_WAIT_LOOP {
-                println!(
-                    "*** CPU EXITED WAIT LOOP! Now at ${:04X} (A=${:02X}) ***",
-                    self.pc, self.a
-                );
-                IN_WAIT_LOOP = false;
-            }
-
-            // Print instructions outside wait loop
-            if self.cycles < 500 && !IN_WAIT_LOOP {
-                println!(
-                    "CPU: ${:04X}: {:02X} (A=${:02X} X=${:02X} Y=${:02X})",
-                    self.pc,
-                    self.bus.read(self.pc),
-                    self.a,
-                    self.x,
-                    self.y
-                );
-            }
-        }
-
         let opcode = self.read_pc_byte();
         let cycles_before = self.cycles;
 

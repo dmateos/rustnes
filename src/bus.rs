@@ -1033,6 +1033,11 @@ impl Bus {
     pub fn set_controller1(&mut self, buttons: u8) {
         self.controller1_state = buttons;
     }
+
+    /// Borrow the internal 2KB CPU RAM for debugging/training introspection.
+    pub fn cpu_ram(&self) -> &[u8] {
+        &self.ram
+    }
 }
 
 // Implementing Default trait for convenience
