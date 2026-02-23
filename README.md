@@ -4,7 +4,7 @@ A cycle-accurate Nintendo Entertainment System (NES) emulator written in Rust wi
 
 ## Features
 
-### Core Emulation
+### Core Emulation 
 - **Cycle-accurate CPU** - Full MOS 6502 instruction set with accurate timing
 - **PPU (2C02)** - Complete graphics processing with scanline-accurate rendering
 - **APU (2A03)** - Full audio processing unit with all 4 main channels:
