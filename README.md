@@ -1,5 +1,5 @@
 # RustNES
-
+ 
 A cycle-accurate Nintendo Entertainment System (NES) emulator written in Rust with full audio support, real-time debugging capabilities, and variable speed control.
 
 ## Features
